@@ -1,0 +1,89 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: lambda function that will sync a source bucket with regional buckets
+Parameters:
+  DestinationBucketName:
+    Type: String
+    Description: Bucket The Events Should be Replicated To
+Resources:
+  MyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.8
+      Timeout: 120
+      Environment:
+        Variables:
+          DestinationBucket: !Ref DestinationBucketName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          session = boto3.session.Session()
+
+          def s3_sync(srcresource, srcbucketname, dst, srcobjs):
+              results = []
+              dstresource = session.resource('s3', region_name=dst['awsRegion'])
+              # Uncomment section below for full diff
+              # srcobjs = list(map(lambda obj: obj.key, list(srcresource.Bucket(srcbucketname).objects.all())))
+              # dstobjs = list(map(lambda obj: obj.key, list(dstresource.Bucket(dst['Name']).objects.all())))
+              # diff = list(set(dstobjs) - set(srcobjs))
+              # for obj in srcobjs:
+              #     if obj in dstobjs:
+              #       if srcresource.Object(srcbucketname, obj).e_tag == dstresource.Object(dst['Name'], obj).e_tag:
+              #         srcobjs.remove(obj)
+              for obj in srcobjs:
+                  copy_source = {
+                    'Bucket': srcbucketname,
+                    'Key':obj
+                  }
+                  result = dstresource.Object(dst['Name'], obj).copy_from(CopySource=copy_source)
+                  results += [result]
+              # Uncomment section below for full diff
+              # for obj in diff:
+              #   result = dstresource.Object(dst['Name'], obj).delete()
+              #   results += [result]
+              return {'bucketName': dst['Name'], 'result': results}
+
+          def lambda_handler(event, context):
+              bucketname = event['Records'][0]['s3']['bucket']['name']
+              bucketregion = event['Records'][0]['awsRegion']
+              src = session.resource('s3', region_name=bucketregion)
+              target_bucket_name = os.environ['DestinationBucket']
+              bucket_location = session.client('s3').get_bucket_location(Bucket=target_bucket_name)['LocationConstraint']
+              target =  {
+                  'awsRegion': bucket_location,
+                  'Name': target_bucket_name,
+                  }
+              #make sure everything in source is also in dest
+              #make sure if its not in source, it is also not in dest
+              srcobjs = list(map(lambda obj: obj['s3']['object']['key'], event['Records']))
+              return s3_sync(src, bucketname, target, srcobjs)
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: s3-bucket-sync-lambda-execution-role
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - arn:aws:s3:::*
+                  - arn:aws:s3:::*/*
