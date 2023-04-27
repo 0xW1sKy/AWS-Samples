@@ -1,2 +1,3 @@
-# AWS-Transfer-Family-Okta-Integration
-A basic template for creating a AWS Transfer Family SFTP service with OKTA as a custom identity provider and storage on S3.
+# AWS-Samples
+
+A collection of deployable AWS configurations. Usually with integration between other tools.
