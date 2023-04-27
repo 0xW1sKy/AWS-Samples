@@ -1,0 +1,443 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: A basic template for creating a AWS Transfer Family SFTP service with OKTA as
+  a custom identity provider and storage on S3.
+Parameters:
+  OKTAAuthAPIURL:
+    Type: String
+    Default: https://example.okta.com/api/v1/authn
+    Description: Okta Authorization API URL (such as https://<YOUR-OKTA-ENDPOINT>/api/v1/authn)
+Outputs:
+  ServerId:
+    Value:
+      Fn::GetAtt: TransferServer.ServerId
+  StackArn:
+    Value:
+      Ref: AWS::StackId
+Resources:
+  S3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  TransferServer:
+    Type: AWS::Transfer::Server
+    Properties:
+      EndpointType: PUBLIC
+      IdentityProviderDetails:
+        InvocationRole:
+          Fn::GetAtt: TransferIdentityProviderRole.Arn
+        Url:
+          Fn::Join:
+            - ''
+            - - 'https://'
+              - Ref: OktaIdentityProviderApi
+              - '.execute-api.'
+              - Ref: AWS::Region
+              - '.amazonaws.com/'
+              - Ref: ApiStage
+      IdentityProviderType: API_GATEWAY
+      LoggingRole:
+        Fn::GetAtt: CloudWatchLoggingRole.Arn
+  CloudWatchLoggingRole:
+    Description: IAM role used by AWS Transfer to log user activity to CloudWatch
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: transfer.amazonaws.com
+            Action: sts:AssumeRole
+      Path: '/'
+      Policies:
+        - PolicyName: TransferLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:DescribeLogStreams
+                - logs:PutLogEvents
+              Resource: '*'
+  TransferS3Access: # Allows AWS Transfer to access S3 bucket
+    Description: Allows AWS Transfer access S3 bucket
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: transfer.amazonaws.com
+            Action: sts:AssumeRole
+      Path: '/'
+      Policies:
+        - PolicyName: TransferS3BucketAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObjectVersion
+                  - s3:GetObjectVersion
+                  - s3:GetObjectACL
+                  - s3:PutObjectACL
+                Resource:
+                  - !Join
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - !Ref S3Bucket
+                      - /*
+
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Join
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - !Ref S3Bucket
+  OktaIdentityProviderApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: Transfer Okta Identity Provider basic template API
+      Description: API used for GetUserConfig requests
+      FailOnWarnings: true
+      EndpointConfiguration:
+        Types:
+        - REGIONAL
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  ApiCloudWatchLogsRole:
+    Description: IAM role used by API Gateway to log API requests to CloudWatch
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ApiGatewayLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource: '*'
+  ApiLoggingAccount:
+    Type: AWS::ApiGateway::Account
+    DependsOn: OktaIdentityProviderApi
+    Properties:
+      CloudWatchRoleArn:
+        Fn::GetAtt: ApiCloudWatchLogsRole.Arn
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId:
+        Ref: ApiDeployment202008
+      MethodSettings:
+        - DataTraceEnabled: false
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          ResourcePath: '/*'
+      RestApiId:
+        Ref: OktaIdentityProviderApi
+      StageName: prod
+  ApiDeployment202008:
+    DependsOn: GetUserConfigRequest
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId:
+        Ref: OktaIdentityProviderApi
+  TransferIdentityProviderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: transfer.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TransferCanInvokeThisApi
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: execute-api:Invoke
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OktaIdentityProviderApi}/prod/GET/*
+        - PolicyName: TransferCanReadThisApi
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: apigateway:GET
+                Resource: '*'
+  GetUserConfigLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          OktaUrl:
+            Ref: OKTAAuthAPIURL
+          UserRole:
+            Fn::GetAtt: TransferS3Access.Arn
+          S3BucketName:
+            Ref: S3Bucket
+      Code:
+        ZipFile:
+          Fn::Sub: |
+            import boto3
+            import json
+            import logging
+            import os
+            from urllib import request, parse
+            #comment
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+            oktaurl = os.environ['OktaUrl']
+            def lambda_handler(event, context):
+                logger.info("Event: User Name [{}], Server ID: [{}]".format(event["username"], event["serverId"]))
+                if "username" not in event or "serverId" not in event or "password" not in event:
+                    return event
+                response = {}
+                # It is recommended to verify server ID against some value, this template does not verify server ID
+                server_id = event["serverId"]
+                username = event["username"]
+                password = event["password"]
+                # This code is designed for usage with Google Authenticator. Google Authenticator has a 6 digit token.
+                # mfaToken = password[-6:]
+                password = password
+                auth = auth_with_okta(username, password)
+                if auth.status == 200:
+                    home_directory = os.environ["S3BucketName"] + "/" + username + "/"
+                    response["Role"] = os.environ["UserRole"]
+                    response["HomeDirectory"] = "/" + home_directory
+                    # Optional JSON blob to further restrict this user's permissions
+                    response["Policy"] = """{
+              "Version": "2012-10-17",
+              "Statement": [
+                  {
+                      "Sid": "AllowListingOfUserFolder",
+                      "Action": [
+                          "s3:ListBucket"
+                      ],
+                      "Effect": "Allow",
+                      "Resource": [
+                          "arn:aws:s3:::${!transfer:HomeBucket}"
+                      ],
+                      "Condition": {
+                          "StringLike": {
+                              "s3:prefix": [
+                                  "${!transfer:UserName}*",
+                                  "${!transfer:UserName}"
+                              ]
+                          }
+                      }
+                  },
+                  {
+                      "Sid": "HomeDirObjectAccess",
+                      "Effect": "Allow",
+                      "Action": [
+                          "s3:PutObject",
+                          "s3:GetObject",
+                          "s3:DeleteObjectVersion",
+                          "s3:DeleteObject",
+                          "s3:GetObjectVersion"
+                      ],
+                      "Resource": "arn:aws:s3:::${!transfer:HomeDirectory}*"
+                   }
+              ]
+            }"""
+                    logger.info("Message: {}".format(response))
+                else:
+                    return 0
+                    logger.info("Failed to authenticate user [{}] with Okta. Received status code of {}".format(username, status_code))
+                return response
+
+            # This function authenticates a user with Okta and returns a status code
+            def auth_with_okta(user_name, password):
+
+                headers = {"Accept": "application/json", "Content-Type": "application/json"}
+                primary_credentials = {"username": user_name, "password": password}
+
+                try:
+                    primary_request = request.Request(url=oktaurl, data=json.dumps(primary_credentials).encode('utf-8'), headers=headers)
+                    primary_response = request.urlopen(primary_request)
+
+                    logger.info("Okta response: [{}]".format(primary_response))
+
+                    primary = json.loads(primary_response.read().decode('utf-8'))
+                    return primary_response
+
+                except Exception as e:
+                    logger.info("Error authing with Okta: {}".format(str(e)))
+                    return 0
+      Description: A function to provide IAM roles and policies for given user and serverId.
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt: LambdaExecutionRole.Arn
+      Runtime: python3.7
+      Timeout: 15
+  GetUserConfigLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName:
+        Fn::GetAtt: GetUserConfigLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        Fn::Join:
+          - ''
+          - - 'arn:aws:execute-api:'
+            - Ref: AWS::Region
+            - ':'
+            - Ref: AWS::AccountId
+            - ':'
+            - Ref: OktaIdentityProviderApi
+            - '/*'
+  ServersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId:
+        Ref: OktaIdentityProviderApi
+      ParentId:
+        Fn::GetAtt:
+          - OktaIdentityProviderApi
+          - RootResourceId
+      PathPart: servers
+  ServerIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId:
+        Ref: OktaIdentityProviderApi
+      ParentId:
+        Ref: ServersResource
+      PathPart: '{serverId}'
+  UsersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId:
+        Ref: OktaIdentityProviderApi
+      ParentId:
+        Ref: ServerIdResource
+      PathPart: users
+  UserNameResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId:
+        Ref: OktaIdentityProviderApi
+      ParentId:
+        Ref: UsersResource
+      PathPart: '{username}'
+  GetUserConfigResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId:
+        Ref: OktaIdentityProviderApi
+      ParentId:
+        Ref: UserNameResource
+      PathPart: config
+  GetUserConfigRequest:
+    Type: AWS::ApiGateway::Method
+    DependsOn: GetUserConfigResponseModel
+    Properties:
+      AuthorizationType: AWS_IAM
+      HttpMethod: GET
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri:
+          Fn::Join:
+            - ''
+            - - 'arn:aws:apigateway:'
+              - Ref: AWS::Region
+              - ':lambda:path/2015-03-31/functions/'
+              - Fn::GetAtt:
+                - GetUserConfigLambda
+                - Arn
+              - '/invocations'
+        IntegrationResponses:
+        - StatusCode: 200
+        RequestTemplates:
+          application/json: |
+            {
+              "username": "$util.urlDecode($input.params('username'))",
+              "password": "$util.escapeJavaScript($input.params('Password')).replaceAll("\\'","'")",
+              "protocol": "$input.params('protocol')",
+              "serverId": "$input.params('serverId')",
+              "sourceIp": "$input.params('sourceIp')"
+            }
+      RequestParameters:
+        method.request.header.Password: false
+        method.request.querystring.protocol: false
+        method.request.querystring.sourceIp: false
+      ResourceId:
+        Ref: GetUserConfigResource
+      RestApiId:
+        Ref: OktaIdentityProviderApi
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: UserConfigResponseModel
+  GetUserConfigResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId:
+        Ref: OktaIdentityProviderApi
+      ContentType: application/json
+      Description: API response for GetUserConfig
+      Name: UserConfigResponseModel
+      Schema:
+        "$schema": http://json-schema.org/draft-04/schema#
+        title: UserUserConfig
+        type: object
+        properties:
+          HomeDirectory:
+            type: string
+          Role:
+            type: string
+          Policy:
+            type: string
+          PublicKeys:
+            type: array
+            items:
+              type: string
+
